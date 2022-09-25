@@ -21,6 +21,9 @@ import pickle
 from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, get_body_barycentric
+from lmfit import Minimizer, conf_interval
+from bilby.core.likelihood import Likelihood
+from bilby.core.sampler import run_sampler
 
 
 def clean_archive(archive, template=None, bandwagon=0.99, channel_threshold=5,
@@ -271,8 +274,8 @@ def get_ssb_delay(mjds, raj, decj):
     from astropy.constants import au, c
     from astropy.coordinates import BarycentricTrueEcliptic, SkyCoord
 
-    coord = SkyCoord('{0} {1}'.format(raj, decj), frame=BarycentricTrueEcliptic,
-                     unit=(u.hourangle, u.deg))
+    coord = SkyCoord('{0} {1}'.format(raj, decj),
+                     frame=BarycentricTrueEcliptic, unit=(u.hourangle, u.deg))
     psr_xyz = coord.cartesian.xyz.value
 
     t = []
@@ -282,7 +285,7 @@ def get_ssb_delay(mjds, raj, decj):
         e_dot_p = np.dot(earth_xyz.xyz.value, psr_xyz)
         t.append(e_dot_p*au.value/c.value)
 
-    print('Returned SSB Roemer delays (in seconds) should be ' + \
+    print('Returned SSB Roemer delays (in seconds) should be ' +
           'ADDED to site arrival times')
 
     return np.array(t)
@@ -800,59 +803,211 @@ def make_dynspec(archive, template=None, phasebin=1):
     return
 
 
-def curvature_log_likelihood(power, nfdop, noise, model_nfdop):
+def get_bilby_parameter_values_and_errors(results):
     """
-    Calculates the log likelihood of a model prediction for nfdop by taking
-    the likelihood function for each observation to be a probability density
-    calculated from the doppler profile.
+    Retrieve the parameter values and errors from a bilby Result object.
 
     Parameters
     ----------
-    power : array_like
-        doppler profile(s)
-    nfdop : array_like
-        nfdop values for doppler profile(s)
-    noise : float or array_like
-        noise value for each profile
-    model_nfdop : float or array_like
-        model preiction for nfdop for each profile
+    results : bilby Result object
+        The result of parameter estimation using bilby.
 
     Returns
     -------
-    float
-        log likelihood of the input data
+    params : dict
+        Dictionary of parameter objects with value and stderr attributes.
 
     """
-    # calculate probability from doppler profile and normalize
-    dim = len(np.shape(nfdop))
-    eta_prob = calculate_curvature_peak_probability(power, noise, log=True)
-    integral = np.sum(np.exp(eta_prob[..., :-1]) * np.diff(nfdop, axis=dim-1),
-                      axis=dim-1)
-    if dim == 2:
-        integral = integral.reshape((len(integral), 1))
-    eta_prob_norm = eta_prob - np.log(integral)
 
-    if dim == 2:
-        like = np.zeros(len(nfdop))  # initialize likelihood list
-        outside = np.argwhere((model_nfdop > np.max(nfdop, axis=1)) |
-                              (model_nfdop < np.min(nfdop, axis=1))).flatten()
-        inside = np.argwhere((model_nfdop < np.max(nfdop, axis=1)) &
-                             (model_nfdop > np.min(nfdop, axis=1))).flatten()
-        like[outside] = -200  # for model nfdop outside profile nfdop ranges
+    class Param():
+        def __init__(self, param_name):
+            p = results.get_one_dimensional_median_and_error_bar(param_name)
+            self.value = p.median
+            self.stderr = (p.plus + p.minus) / 2
 
-        # determine likelihoods at model nfdop
-        model_nfdop = model_nfdop[inside].reshape((len(model_nfdop[inside]),
-                                                   1))
-        inds = np.argmin(np.abs(nfdop[inside] - model_nfdop), axis=1)
-        like[inside] = eta_prob_norm[inside, inds]
+    param_names = list(results.priors.keys())
+    params = {}
+    for key in param_names:
+        params[key] = Param(key)
 
-        return np.sum(like)
+    return params
 
-    elif dim == 1:
-        if np.min(nfdop) < model_nfdop < np.max(nfdop):
-            return eta_prob_norm[np.argmin(np.abs(nfdop - model_nfdop))]
-        else:
-            return -200
+
+def fitter(y, model, params, errors=None, bayesian=False, sampler='dynesty',
+           priors=None, npoints=100, outdir='outdir', resume=False,
+           check_point=True, npool=1, save=True, label='dynesty',
+           verbose=False, nan_policy='raise', max_nfev=None, get_ci=False,
+           **kwargs):
+
+    if bayesian:
+        params_ = {**params, **priors}
+
+        likelihood = GaussianLikelihood(y, model, params_, errors, **kwargs)
+
+        results = run_sampler(likelihood, priors=priors, sampler=sampler,
+                              label=label, npoints=npoints, verbose=verbose,
+                              resume=resume, check_point=check_point,
+                              npool=npool, check_point_delta_t=600,
+                              save=save, outdir=outdir)
+        return results
     else:
-        raise ValueError("Invalid input array dimension. Must be either 1D "
-                         "(single observation) or 2D (multiple observations)")
+        if errors is None:
+            errors = np.ones(np.shape(y))
+
+        def minimizer(params):
+            return (y - model(params, **kwargs)) / errors
+
+        func = Minimizer(minimizer, params, fcn_args=None,
+                         nan_policy=nan_policy, max_nfev=max_nfev)
+        results = func.minimize()
+        if get_ci:
+            if results.errorbars:
+                ci = conf_interval(func, results)
+            else:
+                ci = ''
+            return results, ci
+        else:
+            return results
+
+
+class SuperLikelihood(Likelihood):
+    """
+    Bilby-compatible class for subclassing likelihood functions.
+
+    """
+
+    def __init__(self, y, func, params, **kwargs):
+
+        super(SuperLikelihood, self).__init__(params)
+        self.y = y
+        self._func = func
+        self.kwargs = kwargs
+
+    @property
+    def func(self):
+        return self._func
+
+    @property
+    def y(self):
+        return self._y
+
+    @y.setter
+    def y(self, y):
+        if isinstance(y, int) or isinstance(y, float):
+            y = np.array([y])
+        self._y = y
+
+    @property
+    def residual(self):
+        return self.y - self.func(self.parameters, **self.kwargs)
+
+
+class GaussianLikelihood(SuperLikelihood):
+    """
+    Bilby-compatible Gaussian likelihood for a specified noise.
+
+    Parameters
+    ----------
+    y : array_like
+        The data.
+    func : func
+        Python function that returns the model values.
+    params : dict
+        Dictionary of the model parameters.
+    sigma : TYPE, optional
+        DESCRIPTION. The default is None.
+    **kwargs :
+        Additional arguments to pass to the model function.
+
+    """
+
+    def __init__(self, y, func, params, sigma=None, **kwargs):
+
+        super(GaussianLikelihood, self).__init__(y=y, func=func, params=params,
+                                                 **kwargs)
+        self.sigma = sigma
+
+    def log_likelihood(self):
+        log_l = np.sum(- (self.residual / self.sigma)**2 / 2 -
+                       np.log(2 * np.pi * self.sigma**2) / 2)
+        return log_l
+
+
+class CurvatureLikelihood(SuperLikelihood):
+    """
+    Bilby-compatible likelihood function calculated from the doppler profiles
+    of secondary spectra.
+
+    curvature_model : func
+        Python function that returns the model arc curvatures.
+    params : dict
+        Dictionary of the model parameters.
+    profiles : array_like
+        The doppler profiles of the observations.
+    nfdop : array_like
+        The normalized fdop axes corresponding to the profiles.
+    sigma : array_like
+        Noise value for each observation.
+    normalization : float
+        Curvature value that the profiles are normalized with respect to.
+    **kwargs :
+        Additional arguments to pass to the model function.
+
+    """
+
+    def __init__(self, curvature_model, params, profiles, nfdop, sigma,
+                 normalization, **kwargs):
+
+        super(CurvatureLikelihood, self).__init__(y=len(profiles),
+                                                  func=curvature_model,
+                                                  params=params, **kwargs)
+
+        self.profiles = profiles
+        self.nfdop = nfdop
+        self.sigma = sigma
+        self.normalization = normalization
+
+    def log_likelihood(self):
+
+        lnefac = self.parameters['lnefac']
+        equad = self.parameters['equad']
+        noise = np.sqrt((self.sigma * np.exp(lnefac))**2 + equad**2)
+
+        dim = len(np.shape(self.profiles))
+        eta_prob = calculate_curvature_peak_probability(
+            self.profiles, noise, log=True)
+        integral = np.sum(np.exp(eta_prob[..., :-1]) *
+                          np.diff(self.nfdop, axis=dim-1), axis=dim-1)
+        if dim == 2:
+            integral = integral.reshape((len(integral), 1))
+        eta_prob_norm = eta_prob - np.log(integral)
+
+        model_nfdop = np.sqrt(self.normalization / -self.residual)
+
+        if dim == 2:
+            like = np.zeros(len(self.nfdop))
+            outside = np.argwhere(
+                (model_nfdop > np.max(self.nfdop, axis=1)) |
+                (model_nfdop < np.min(self.nfdop, axis=1))).flatten()
+            inside = np.argwhere(
+                (model_nfdop < np.max(self.nfdop, axis=1)) &
+                (model_nfdop > np.min(self.nfdop, axis=1))).flatten()
+            like[outside] = -200  # for model nfdop outside profile nfdop range
+
+            model_nfdop = model_nfdop[inside].reshape(
+                (len(model_nfdop[inside]), 1))
+            inds = np.argmin(np.abs(self.nfdop[inside] - model_nfdop), axis=1)
+            like[inside] = eta_prob_norm[inside, inds]
+
+            return np.sum(like)
+
+        elif dim == 1:
+            if np.min(self.nfdop) < model_nfdop < np.max(self.nfdop):
+                return eta_prob_norm[
+                    np.argmin(np.abs(self.nfdop - model_nfdop))]
+            else:
+                return -200
+        else:
+            raise ValueError("Invalid input array dimension. Must be either \
+                             1D (single observation) or 2D \
+                                 (multiple observations)")

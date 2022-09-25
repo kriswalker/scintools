@@ -242,7 +242,7 @@ class Simulation():
         spi = np.real(np.multiply(self.spe, np.conj(self.spe)))
         self.spi = spi
 
-        self.x = np.linspace(0, self.dx*(self.nx), (self.nx+1))
+        self.x = np.linspace(0, self.dx*(self.nx-1), self.nx)
         ifreq = np.arange(0, self.nf+1)
         lam_norm = 1.0 + self.dlam * (ifreq - 1 - (self.nf / 2)) / self.nf
         self.lams = lam_norm / np.mean(lam_norm)
@@ -410,6 +410,7 @@ class Simulation():
         self.plot_intensity(subplot=True)
         plt.subplot(2, 1, 2)
         self.plot_dynspec(subplot=True)
+        plt.tight_layout()
         plt.show()
 
 
@@ -418,7 +419,7 @@ class ACF():
     def __init__(self, V=1, psi=0, phasegrad=0, theta=0, ar=1, alpha=5/3,
                  taumax=4, dnumax=4, nf=51, nt=51, amp=1, wn=0,
                  spatial_factor=2, resolution_factor=1, core_factor=2,
-                 auto_sampling=True, plot=False, display=True):
+                 auto_sampling=True):
         """
         Generate an ACF from the theoretical function in:
             Rickett et al. (2014)
@@ -481,12 +482,6 @@ class ACF():
 
         # default resolutions with sampling factors = 1
         self.dsp = 4*spmax/(nt-1)
-
-        # calculate the ACF
-        self.calc_acf()
-
-        if plot:
-            self.plot_acf(display=display)
 
         return
 
@@ -636,13 +631,15 @@ class ACF():
             gammitv[:, 0] = np.exp(-0.5*((snx/sqrtar)**2 +
                                          (sny*sqrtar)**2)**alph2)
             gammitv[np.argwhere(snx == 0), 0] += wn/amp
+
+            snxt = snx - 2*sigxn*dnun[1]
+            snyt = sny - 2*sigyn*dnun[1]
             for isn in range(0, len(snx)):
-                snxt = snx - 2*sigxn*dnun[1]
-                snyt = sny - 2*sigyn*dnun[1]
                 ARG = ((SNPX2-snxt[isn])**2 + (SNPY2-snyt[isn])**2)/(2*dnun[1])
                 temp = gammes2 * np.exp(1j*ARG)
                 gammitv[isn, 1] = -1j*((dsp/core_fac)**2 *
                                        np.sum(temp)/((2*np.pi)*dnun[1]))
+
             for idn in range(2, ndnun):
                 snxt = snx - 2*sigxn*dnun[idn]
                 snyt = sny - 2*sigyn*dnun[idn]
@@ -683,6 +680,9 @@ class ACF():
         """
         Plots the simulated ACF
         """
+        if not hasattr(self, 'acf'):
+            self.calc_acf()
+
         # for plotting, we need to expand tn and fn,
         #   since they are pixel edges, not centres
         dtn = np.abs(self.tn[1] - self.tn[0])
@@ -1048,4 +1048,3 @@ class Brightness():
         plt.xlabel('Delay')
         plt.ylabel('Log Power')
         plt.show()
-

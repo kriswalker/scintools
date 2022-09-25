@@ -18,14 +18,14 @@ import scipy.constants as sc
 from copy import deepcopy as cp
 from scintools.scint_models import scint_acf_model, scint_acf_model_2d_approx,\
                          scint_acf_model_2d, tau_acf_model, dnu_acf_model,\
-                         fit_parabola, fit_log_parabola, fitter, \
-                         powerspectrum_model
+                         fit_parabola, fit_log_parabola, powerspectrum_model
 from scintools.scint_utils import is_valid, svd_model, interp_nan_2d,\
-    centres_to_edges
+    centres_to_edges, fitter, get_bilby_parameter_values_and_errors
 from scipy.interpolate import griddata, interp1d, RectBivariateSpline
 from scipy.signal import convolve2d, medfilt, savgol_filter
 from scipy.io import loadmat
 from lmfit import Parameters
+from bilby.core.prior import Uniform, Gaussian
 try:
     from skimage.restoration import inpaint
     biharmonic = True
@@ -313,7 +313,7 @@ class Dynspec:
 
         self.trim_edges()  # remove zeros on band edges
         self.refill()  # refill and zeroed regions with linear interpolation
-        self.correct_dyn()  # correct by svd
+        # self.correct_dyn()  # correct by svd
         self.calc_acf()  # calculate the ACF
         if lamsteps:
             self.scale_dyn()
@@ -1229,11 +1229,12 @@ class Dynspec:
 
     def norm_sspec(self, eta=None, delmax=None, plot=False, startbin=1,
                    maxnormfac=5, minnormfac=0, cutmid=0, lamsteps=True,
-                   scrunched=True, plot_fit=True, ref_freq=1400, velocity=False,
-                   numsteps=None,  filename=None, display=True, weighted=True,
-                   unscrunched=True, logsteps=False, powerspec=True,
-                   interp_nan=False, fit_spectrum=False, powerspec_cut=False,
-                   figsize=(9, 9), subtract_artefacts=False, dpi=200):
+                   scrunched=True, plot_fit=True, ref_freq=1400,
+                   velocity=False, numsteps=None,  filename=None, display=True,
+                   weighted=True, unscrunched=True, logsteps=False,
+                   powerspec=True, interp_nan=False, fit_spectrum=False,
+                   powerspec_cut=False, figsize=(9, 9),
+                   subtract_artefacts=False, dpi=200):
         """
         Normalise fdop axis using arc curvature
 
@@ -1453,7 +1454,8 @@ class Dynspec:
             params.add('alpha', value=alpha, vary=True, min=-np.inf, max=0)
             params.add('amp', value=amp, vary=True, min=0.0, max=np.inf)
 
-            results = fitter(powerspectrum_model, params, (xdata, ydata))
+            results = fitter(ydata, powerspectrum_model, params,
+                             wavenumber=xdata)
 
             params = results.params
 
@@ -1783,11 +1785,10 @@ class Dynspec:
         return
 
     def get_scint_params(self, method="acf1d", plot=False, alpha=5/3,
-                         mcmc=False, full_frame=False, nscale=5,
-                         nwalkers=100, steps=1000, burn=0.2, nitr=1,
-                         lnsigma=True, verbose=False, progress=True,
-                         display=True, filename=None, dpi=200,
-                         nan_policy='raise', weighted=True, workers=1,
+                         bayesian=False, full_frame=False, nscale=5,
+                         npoints=100, outdir=None, nitr=1, verbose=False,
+                         progress=True, display=True, filename=None, dpi=200,
+                         nan_policy='raise', weighted=True, npool=1,
                          tau_vary_2d=True, tau_input=None):
         """
         Measure the scintillation timescale
@@ -1882,6 +1883,9 @@ class Dynspec:
         if not hasattr(self, 'sspec') and 'sspec' in method:
             self.calc_sspec()
 
+        if method != 'acf2d':
+            bayesian = False
+
         nf, nt = np.shape(self.acf)
         ydata_f = self.acf[int(nf/2):, int(nt/2)]
         xdata_f = self.df * np.linspace(0, len(ydata_f)-1, len(ydata_f))
@@ -1921,6 +1925,7 @@ class Dynspec:
             ydata_t = ydata_t[t_inds]
             xdata_f = xdata_f[f_inds]
             ydata_f = ydata_f[f_inds]
+        ydata = np.concatenate((ydata_t, ydata_f))
 
         # Save values determined without fitting: over-write if improved
         self.tau = tau
@@ -1933,8 +1938,7 @@ class Dynspec:
             tau_half = self.dt
         elif tau_half > self.tobs:
             tau_half = self.tobs
-        nscint = (1 + 0.2*self.bw/(self.dnu)) * \
-            (1 + 0.2*self.tobs/(tau_half))
+        nscint = (1 + 0.2*self.bw/(self.dnu)) * (1 + 0.2*self.tobs/(tau_half))
         # Estimated errors
         self.dnuerr = dnu / np.sqrt(nscint)
         self.tauerr = tau / np.sqrt(nscint)
@@ -1998,6 +2002,7 @@ class Dynspec:
         else:
             weights_t = None
             weights_f = None
+        weights = np.concatenate((weights_t, weights_f))
 
         if method == 'acf1d' or method == 'acf2d_approx' or method == 'acf2d':
             if verbose:
@@ -2008,10 +2013,10 @@ class Dynspec:
             nfit = 4
             # max_nfev = 2000 * (nfit + 1)  # lmfit default
             max_nfev = 10000 * (nfit + 1)
-            results = fitter(scint_acf_model, params,
-                             ((xdata_t, xdata_f), (ydata_t, ydata_f),
-                              (weights_t, weights_f)), max_nfev=max_nfev,
-                             nan_policy=nan_policy)
+            results = fitter(ydata, scint_acf_model, params, 1/weights,
+                             bayesian=False, nan_policy=nan_policy,
+                             max_nfev=max_nfev, get_ci=False, time_lag=xdata_t,
+                             frequency_lag=xdata_f)
 
         # overwrite initial value if successful:
         if results.params['dnu'].stderr is not None:
@@ -2094,8 +2099,11 @@ class Dynspec:
                 fdata = fdata_centered[fmin:fmax]
             else:
                 ydata_2d = ydata_centered
+                weights_2d = weights_centered
                 tdata = tdata_centered
                 fdata = fdata_centered
+
+            weights_2d = np.ones(np.shape(ydata_2d))
 
             params.add('phasegrad', value=0, vary=True,
                        min=-np.inf, max=np.inf)
@@ -2113,45 +2121,13 @@ class Dynspec:
                 print("\nPerforming least-squares fit to approximate 2D " +
                       "ACF model")
 
-            pos_array = []
-            if mcmc:
-                for i in range(nwalkers):
-                    pos_i = []
-                    if tau_vary_2d:
-                        pos_i.append(np.random.normal(
-                                        loc=self.tau,
-                                        scale=2*self.tauerr))
-                    pos_i.append(np.random.normal(
-                                    loc=self.dnu,
-                                    scale=2*self.dnuerr))
-                    pos_i.append(np.random.normal(
-                                    loc=self.amp,
-                                    scale=2*self.amperr))
-                    if 'sim:mb2=' not in self.name:
-                        pos_i.append(np.random.normal(
-                                        loc=self.wn,
-                                        scale=self.wnerr))
-                    if alpha is None:
-                        pos_i.append(np.random.normal(loc=5/3, scale=0.1))
-                    pos_i.append(np.random.uniform(low=0,
-                                                   high=5))  # phase grad
-                    if lnsigma:
-                        pos_i.append(np.random.uniform(low=0,
-                                                       high=10))
-
-                    pos_array.append(pos_i)
-                pos = np.array(pos_array).squeeze()
-            else:
-                pos = None
             nfit = 5
             # max_nfev = 2000 * (nfit + 1)  # lmfit default
             max_nfev = 10000 * (nfit + 1)
-            results = fitter(scint_acf_model_2d_approx, params,
-                             (tdata, fdata, ydata_2d, None), mcmc=mcmc,
-                             max_nfev=max_nfev, nan_policy=nan_policy,
-                             pos=pos, steps=steps, burn=burn,
-                             progress=progress, workers=workers,
-                             is_weighted=(not lnsigma))
+            results = fitter(ydata_2d, scint_acf_model_2d_approx, params,
+                             1/weights_2d, max_nfev=max_nfev,
+                             nan_policy=nan_policy, get_ci=False,
+                             time_lag=tdata, frequency_lag=fdata)
 
             if method == 'acf2d':
 
@@ -2159,118 +2135,106 @@ class Dynspec:
                     print('2D tau estimate:', results.params['tau'].value,
                           '\n2D dnu estimate:', results.params['dnu'].value)
 
-                params2d = results.params
-                params2d.add('ar', value=2,
-                             vary=False, min=-np.inf, max=np.inf)
-                params2d.add('theta', value=0,
-                             vary=False, min=-np.inf, max=np.inf)
-                params2d.add('psi', value=60,
-                             vary=True, min=-np.inf, max=np.inf)
                 chisqr = np.inf
+                if bayesian:
+                    nitr = 1
                 for itr in range(nitr):
-                    if mcmc:
-                        pos_array = []
-                        for i in range(nwalkers):
-                            pos_i = []
-                            if tau_vary_2d:
-                                pos_i.append(np.random.normal(
-                                    loc=results.params['tau'].value,
-                                    scale=results.params['tau'].value/2))
-                            pos_i.append(np.random.normal(
-                                loc=results.params['dnu'].value,
-                                scale=results.params['dnu'].value/2))
-                            pos_i.append(np.random.normal(
-                                loc=results.params['amp'].value,
-                                scale=results.params['amp'].value/2))
-                            if 'sim:mb2=' not in self.name:
-                                pos_i.append(np.random.normal(
-                                    loc=results.params['wn'].value,
-                                    scale=results.params['wn'].value/2))
-                            if alpha is None:
-                                pos_i.append(np.random.normal(
-                                    loc=results.params['alpha'].value,
-                                    scale=results.params['alpha'].value/2))
-                            pos_i.append(np.random.normal(
-                                loc=results.params['phasegrad'].value,
-                                scale=results.params['phasegrad'].value/2))
-                            pos_i.append(np.random.uniform(low=0,
-                                                           high=90))  # psi
-                            if lnsigma:
-                                pos_i.append(np.random.uniform(low=0,
-                                                               high=10))
+                    if bayesian:
+                        priors = dict()
+                        if tau_vary_2d:
+                            priors['tau'] = Gaussian(
+                                results.params['tau'].value,
+                                results.params['tau'].value/2,
+                                'tau', latex_label=r'$\tau_d$')
+                        priors['dnu'] = Gaussian(
+                            results.params['dnu'].value,
+                            results.params['dnu'].value/2,
+                            'dnu', latex_label=r'$\nu_d$')
+                        priors['amp'] = Gaussian(
+                            results.params['amp'].value,
+                            results.params['amp'].value/2,
+                            'amplitude')
+                        if 'sim:mb2=' not in self.name:
+                            priors['wn'] = Gaussian(
+                                results.params['wn'].value,
+                                results.params['wn'].value/2,
+                                'white noise')
+                        if alpha is None:
+                            priors['alpha'] = Gaussian(
+                                results.params['alpha'].value,
+                                results.params['apha'].value/2,
+                                'alpha', latex_label=r'$\alpha$')
+                        priors['phasegrad'] = Gaussian(
+                            results.params['phasegrad'].value,
+                            results.params['phasegrad'].value/2,
+                            'phasegrad', latex_label=r'$\nabla\phi$')
+                        priors['psi'] = Uniform(0, 90, 'psi',
+                                                latex_label=r'$\psi$')
+                        priors['ar'] = 2
+                        priors['theta'] = 0
 
-                            pos_array.append(pos_i)
-                        pos = np.array(pos_array)
+                        params_2d = {**results.params, **priors}
                     else:
-                        pos = None
+                        params_2d = results.params
+                        params_2d.add('ar', value=2,
+                                      vary=False, min=-np.inf, max=np.inf)
+                        params_2d.add('theta', value=0,
+                                      vary=False, min=-np.inf, max=np.inf)
+                        params_2d.add('psi', value=60,
+                                      vary=True, min=-np.inf, max=np.inf)
+                        priors = None
                     if verbose:
-                        if mcmc:
-                            print("\nPerforming mcmc posterior sample for",
-                                  "analytical", "2D ACF model")
+                        if bayesian:
+                            print("\nPerforming Bayesian parameter estimation",
+                                  "on analytical", "2D ACF model")
                         else:
                             print("\nPerforming least-squares fit to",
                                   "analytical 2D ACF model")
                     nfit = 9
                     # max_nfev = 2000 * (nfit + 1)  # lmfit default
                     max_nfev = 10000 * (nfit + 1)
-                    res = fitter(scint_acf_model_2d, params2d,
-                                 (ydata_2d, None), mcmc=mcmc, pos=pos,
-                                 nwalkers=nwalkers, steps=steps, burn=burn,
-                                 progress=progress, workers=workers,
-                                 max_nfev=max_nfev, nan_policy=nan_policy,
-                                 is_weighted=(not lnsigma))
-                    if res.chisqr < chisqr:
-                        chisqr = res.chisqr
+                    res = fitter(ydata_2d, scint_acf_model_2d, params_2d,
+                                 1/weights_2d, bayesian=bayesian,
+                                 sampler='dynesty', priors=priors,
+                                 npoints=npoints, outdir=outdir, npool=npool,
+                                 nan_policy=nan_policy, max_nfev=max_nfev,
+                                 get_ci=False, dim=np.shape(ydata_2d))
+                    if bayesian:
                         results = res
+                    else:
+                        if res.chisqr < chisqr:
+                            chisqr = res.chisqr
+                            results = res
 
         elif method == 'sspec':
             '''
             sspec method
             '''
             print("This method doesn't work yet, do something else")
-            # fdyn = np.fft.fft2(self.dyn, (2 * nf, 2 * nt))
-            # fdynsq = fdyn * np.conjugate(fdyn)
 
-            # secspec = np.real(fdynsq)
-            # secspec = np.fft.fftshift(fdynsq)
-            # secspec = secspec[nf:2*nf, :]
-            # secspec = np.real(secspec)
+        if bayesian:
+            results_params = get_bilby_parameter_values_and_errors(results)
+            p = {}
+            for key in results_params.keys():
+                p[key] = results_params[key].value
+            results_params_values = {**params, **p}
+        else:
+            results_params = results.params
+            results_params_values = results_params.valuesdict()
 
-            # rowsum = np.sum(secspec[:, :nt], axis=0)
-            # ydata_t = rowsum / (2*nf)
-            # colsum = np.sum(secspec[:nf, :], axis=1)
-            # ydata_f = colsum / (2 * nt)
-
-            # # concatenate x and y arrays
-            # xdata = np.array(np.concatenate((xdata_t, xdata_f)))
-            # ydata = np.concatenate((ydata_t, ydata_f))
-
-            # if verbose:
-            #     print("\nPerforming least-squares fit to secondary spectrum")
-            # chisqr = np.inf
-            # for itr in range(nitr):
-            #     results = fitter(scint_sspec_model, params,
-            #                      (xdata, ydata), nan_policy=nan_policy,
-            #                       mcmc=mcmc, is_weighted=(not lnsigma),
-            #                       burn=burn, nwalkers=nwalkers, steps=steps)
-            #     if results.chisqr < chisqr:
-            #         chisqr = results.chisqr
-            #         params = results.params
-            #         res = results
-
-        if results.params['tau'].stderr is None or \
-           results.params['dnu'].stderr is None:
+        if results_params['tau'].stderr is None or \
+           results_params['dnu'].stderr is None:
             print("\n Warning: Fit failed")
-            return
-        elif (results.params['tau'].stderr > results.params['tau'].value or
-              results.params['dnu'].stderr > results.params['dnu'].value):
+            # return
+        elif (results_params['tau'].stderr > results_params['tau'].value or
+              results_params['dnu'].stderr > results_params['dnu'].value):
             print("\n Warning: Parameters unconstraiend")
 
         self.scint_param_method = method
 
         # Done fitting - now define results
-        self.tau = results.params['tau'].value
-        self.dnu = results.params['dnu'].value
+        self.tau = results_params['tau'].value
+        self.dnu = results_params['dnu'].value
         self.tscat = 1/(2*np.pi*self.dnu)  # scattering timescale
         if self.dnu < self.df:
             print("Warning: Scint bandwidth < channel bandwidth.")
@@ -2279,9 +2243,9 @@ class Dynspec:
             (1 + 0.2*self.tobs/(self.tau*np.log(2)))
         self.nscint = nscint
         self.fse_tau = self.tau/(2*np.sqrt(nscint))
-        fit_tau = results.params['tau'].stderr
+        fit_tau = results_params['tau'].stderr
         self.fse_dnu = self.dnu/(2*np.sqrt(nscint))
-        fit_dnu = results.params['dnu'].stderr
+        fit_dnu = results_params['dnu'].stderr
 
         if verbose:
             print("\nFinite scintle errors (tau, dnu):\n",
@@ -2297,32 +2261,29 @@ class Dynspec:
         self.tauerr = np.sqrt(fit_tau**2 + self.fse_tau**2)
         self.dnuerr = np.sqrt(fit_dnu**2 + self.fse_dnu**2)
 
-        self.amp = results.params['amp'].value
-        self.amperr = results.params['amp'].stderr
+        self.amp = results_params['amp'].value
+        self.amperr = results_params['amp'].stderr
         if 'sim:mb2=' not in self.name:
-            self.wn = results.params['wn'].value
-            self.wnerr = results.params['wn'].stderr
+            self.wn = results_params['wn'].value
+            self.wnerr = results_params['wn'].stderr
         else:
             self.wn = 0
         if alpha is None:
-            self.talpha = results.params['alpha'].value
-            self.talphaerr = results.params['alpha'].stderr
+            self.talpha = results_params['alpha'].value
+            self.talphaerr = results_params['alpha'].stderr
         else:
             self.talpha = alpha
             self.talphaerr = 0
         if method[:5] == 'acf2d':
-            weights = np.ones(np.shape(ydata_2d))
             if method == 'acf2d_approx':
-                model = -scint_acf_model_2d_approx(
-                    results.params, tdata, fdata,
-                    np.zeros(np.shape(ydata_2d)), None)
+                model = scint_acf_model_2d_approx(results_params_values, tdata,
+                                                  fdata)
             else:
-                model = -scint_acf_model_2d(results.params,
-                                            np.zeros(np.shape(ydata_2d)),
-                                            None)
+                model = scint_acf_model_2d(results_params_values,
+                                           np.shape(ydata_2d))
             self.acf_model = model
-            self.phasegrad = results.params['phasegrad'].value
-            fit_ph = results.params['phasegrad'].stderr
+            self.phasegrad = results_params['phasegrad'].value
+            fit_ph = results_params['phasegrad'].stderr
             if fit_ph is None:
                 fit_ph = np.inf
             fse_ph = self.phasegrad * np.sqrt((self.fse_dnu/self.dnu)**2 +
@@ -2330,12 +2291,12 @@ class Dynspec:
             self.phasegraderr = fit_ph
             self.fse_phasegrad = fse_ph
             if method == 'acf2d':
-                self.ar = results.params['ar'].value
-                self.arerr = results.params['ar'].stderr
-                self.theta = results.params['theta'].value
-                self.thetaerr = results.params['theta'].stderr
-                self.psi = results.params['psi'].value
-                self.psierr = results.params['psi'].stderr
+                self.ar = results_params['ar'].value
+                self.arerr = results_params['ar'].stderr
+                self.theta = results_params['theta'].value
+                self.thetaerr = results_params['theta'].stderr
+                self.psi = results_params['psi'].value
+                self.psierr = results_params['psi'].stderr
 
         if verbose:
             print("\n\t ACF FIT PARAMETERS\n")
@@ -2360,10 +2321,8 @@ class Dynspec:
 
         if plot:
             if method == 'acf1d':
-                tmodel = -tau_acf_model(results.params, xdata_t,
-                                        np.zeros(len(xdata_t)), None)
-                fmodel = -dnu_acf_model(results.params, xdata_f,
-                                        np.zeros(len(xdata_f)), None)
+                tmodel = tau_acf_model(results_params_values, xdata_t)
+                fmodel = dnu_acf_model(results_params_values, xdata_f)
 
                 fig = plt.subplots(2, 1, figsize=(8, 6))
                 fig[1][0].plot(xdata_t, ydata_t, label='data')
@@ -2416,16 +2375,14 @@ class Dynspec:
                 plt.close(fig[0])
 
             elif method[:5] == 'acf2d':
-                weights = np.ones(np.shape(ydata_2d))
                 if method == 'acf2d_approx':
-                    model = -scint_acf_model_2d_approx(
-                        results.params, tdata, fdata,
-                        np.zeros(np.shape(ydata_2d)), None)
+                    model = scint_acf_model_2d_approx(results_params_values,
+                                                      tdata,
+                                                      fdata)
                 else:
-                    model = -scint_acf_model_2d(results.params,
-                                                np.zeros(np.shape(ydata_2d)),
-                                                None)
-                residuals = (ydata_2d - model) * weights
+                    model = scint_acf_model_2d(results_params_values,
+                                               np.shape(ydata_2d))
+                residuals = (ydata_2d - model) * weights_2d
 
                 fig = plt.subplots(1, 3, sharey=True, figsize=(15, 5))
                 data = [(ydata_2d, 'data'), (model, 'model'),
@@ -2466,17 +2423,8 @@ class Dynspec:
                 sspec plotting routine
                 '''
 
-            if mcmc and method == "acf2d":
-                corner.corner(results.flatchain,
-                              labels=results.var_names,
-                              truths=list(results.params.valuesdict().
-                                          values()))
-                if filename is not None:
-                    filename_name = ''.join(filename.split('.')[0:-1])
-                    filename_extension = filename.split('.')[-1]
-                    plt.savefig(filename_name + '_corner.'
-                                + filename_extension, dpi=dpi,
-                                bbox_inches='tight', pad_inches=0.1)
+            if bayesian and method == "acf2d":
+                results.plot_corner()
                 if display:
                     plt.show()
                 plt.close()
@@ -3454,7 +3402,7 @@ class Dynspec:
                 elif vism_zeta is not None:
                     veff2 = (veff_ra*np.sin(zeta) +
                              veff_dec*np.cos(zeta) - vism_zeta)**2
-                else: # No Vism_psi, maybe have ra and dec velocities?
+                else:  # No Vism_psi, maybe have ra and dec velocities?
                     if 'vism_ra' in pars.keys():
                         veff_ra -= pars['vism_ra']
                     elif vism_ra is not None:
