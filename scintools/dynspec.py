@@ -426,7 +426,7 @@ class Dynspec:
 
     def plot_acf(self, method='acf1d', alpha=5/3, contour=False, filename=None,
                  input_acf=None, input_t=None, input_f=None, nscale=4,
-                 mcmc=False, display=True, crop=False, tlim=None, flim=None,
+                 display=True, crop=False, tlim=None, flim=None,
                  figsize=(9, 9), verbose=False, dpi=200):
         """
         Plot the autocorrelation function
@@ -488,7 +488,7 @@ class Dynspec:
             self.calc_acf()
         if not hasattr(self, 'tau') and input_acf is None:
             try:
-                self.get_scint_params(method=method, alpha=alpha, mcmc=mcmc,
+                self.get_scint_params(method=method, alpha=alpha,
                                       verbose=verbose)
             except Exception as e:
                 print(e)
@@ -2172,6 +2172,9 @@ class Dynspec:
                                                 latex_label=r'$\psi$')
                         priors['ar'] = 2
                         priors['theta'] = 0
+                        priors['lnefac'] = Uniform(
+                            -5, 5, 'lnefac',
+                            latex_label=r'$\ln E_\mathrm{fac}$')
 
                         params_2d = {**results.params, **priors}
                     else:

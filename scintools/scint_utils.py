@@ -914,22 +914,31 @@ class GaussianLikelihood(SuperLikelihood):
         Python function that returns the model values.
     params : dict
         Dictionary of the model parameters.
-    sigma : TYPE, optional
-        DESCRIPTION. The default is None.
+    sigma : array_like
+        Noise values.
     **kwargs :
         Additional arguments to pass to the model function.
 
     """
 
-    def __init__(self, y, func, params, sigma=None, **kwargs):
+    def __init__(self, y, func, params, sigma, **kwargs):
 
         super(GaussianLikelihood, self).__init__(y=y, func=func, params=params,
                                                  **kwargs)
+        if 'lnefac' not in params:
+            params['lnefac'] = 0
+        if 'equad' not in params:
+            params['equad'] = 0
         self.sigma = sigma
 
     def log_likelihood(self):
-        log_l = np.sum(- (self.residual / self.sigma)**2 / 2 -
-                       np.log(2 * np.pi * self.sigma**2) / 2)
+
+        lnefac = self.parameters['lnefac']
+        equad = self.parameters['equad']
+        sigma = np.sqrt((self.sigma * np.exp(lnefac))**2 + equad**2)
+
+        log_l = np.sum(- (self.residual / sigma)**2 / 2 -
+                       np.log(2 * np.pi * sigma**2) / 2)
         return log_l
 
 
